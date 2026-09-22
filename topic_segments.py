@@ -1,16 +1,47 @@
 import os
+import re
 import pysbd
 import numpy as np
+from collections import Counter
 from sentence_transformers import SentenceTransformer
 
 input_path = "input.txt"
 model_name = "google/embeddinggemma-300m"
 language = input("Language (en): ") or "en"
 TRUST_CODE = False
-COHESION_WINDOW = 6
+NEIGHBOR_RADIUS = 4
+LOCAL_K = 3
+LEXICAL_WINDOW = 6
+MIN_WORD_LENGTH = 5
+EMBEDDING_WEIGHT = 0.6
+LEXICAL_WEIGHT = 0.4
 TARGET_SENTENCES_PER_BREAK = 5
 MIN_SENTENCES_BETWEEN_BREAKS = 3
 REQUESTED_BREAK_COUNT = None
+
+STOPWORDS_BY_LANGUAGE = {
+    "en": {
+        "about", "after", "again", "against", "almost", "along", "already",
+        "although", "always", "among", "another", "anyone", "anything",
+        "around", "because", "become", "becomes", "before", "behind",
+        "being", "below", "between", "beyond", "cannot", "could", "during",
+        "either", "enough", "every", "everyone", "everything", "further",
+        "having", "hence", "herself", "himself", "however", "indeed",
+        "instead", "itself", "little", "might", "more", "most", "much",
+        "myself", "neither", "never", "nobody", "nothing", "often", "once",
+        "only", "other", "others", "ourselves", "outside", "over", "perhaps",
+        "rather", "really", "same", "several", "shall", "should", "since",
+        "some", "someone", "something", "sometimes", "still", "such",
+        "than", "that", "their", "theirs", "themselves", "then", "there",
+        "therefore", "these", "they", "this", "those", "though", "through",
+        "throughout", "thus", "today", "together", "toward", "towards",
+        "under", "unless", "until", "upon", "very", "was", "were", "what",
+        "whatever", "when", "whenever", "where", "whereas", "wherever",
+        "whether", "which", "while", "who", "whoever", "whom", "whose",
+        "will", "with", "within", "without", "would", "yourself",
+        "yourselves",
+    }
+}
 
 def load_text():
     with open(input_path, "r", encoding="utf-8") as f:
@@ -29,38 +60,94 @@ def embed_sentences(sentences):
 def pairwise_similarity(a, b):
     return a @ b.T
 
-def mean_cohesion(matrix):
-    n = matrix.shape[0]
-    if n < 2:
+def local_cohesion(embeddings, index, side, radius, k):
+    n = embeddings.shape[0]
+    if side == "left":
+        block_start = max(0, index - radius)
+        block = embeddings[block_start:index]
+        anchor = embeddings[index - 1]
+    else:
+        block_end = min(n, index + radius)
+        block = embeddings[index:block_end]
+        anchor = embeddings[index]
+    if block.shape[0] == 0:
         return 1.0
-    total = matrix.sum() - np.trace(matrix)
-    count = n * n - n
-    return total / count if count > 0 else 1.0
+    sims = block @ anchor
+    sims = np.sort(sims)[::-1]
+    top_k = sims[: min(k, sims.shape[0])]
+    return float(top_k.mean())
 
-def mean_cross_similarity(matrix):
-    if matrix.size == 0:
-        return 1.0
-    return matrix.mean()
+def boundary_adjacent_drop(embeddings, index):
+    left_vec = embeddings[index - 1]
+    right_vec = embeddings[index]
+    return float(left_vec @ right_vec)
 
-def compute_boundary_scores(embeddings, window):
+def compute_embedding_scores(embeddings, radius, k):
     n = embeddings.shape[0]
     scores = np.zeros(n)
     for i in range(1, n):
-        left_low = max(0, i - window)
-        right_high = min(n, i + window)
-        left_block = embeddings[left_low:i]
-        right_block = embeddings[i:right_high]
-        if left_block.shape[0] == 0 or right_block.shape[0] == 0:
-            continue
-        left_left_sim = pairwise_similarity(left_block, left_block)
-        right_right_sim = pairwise_similarity(right_block, right_block)
-        left_right_sim = pairwise_similarity(left_block, right_block)
-        left_cohesion = mean_cohesion(left_left_sim)
-        right_cohesion = mean_cohesion(right_right_sim)
-        cross_similarity = mean_cross_similarity(left_right_sim)
+        left_cohesion = local_cohesion(embeddings, i, "left", radius, k)
+        right_cohesion = local_cohesion(embeddings, i, "right", radius, k)
+        adjacent_similarity = boundary_adjacent_drop(embeddings, i)
         side_cohesion = (left_cohesion + right_cohesion) / 2.0
-        scores[i] = side_cohesion - cross_similarity
+        scores[i] = side_cohesion - adjacent_similarity
     return scores
+
+def tokenize_content_words(sentence):
+    words = re.findall(r"[^\W\d_]+", sentence.lower(), flags=re.UNICODE)
+    stopwords = STOPWORDS_BY_LANGUAGE.get(language, set())
+    content_words = [w for w in words if len(w) >= MIN_WORD_LENGTH and w not in stopwords]
+    return content_words
+
+def build_sentence_word_lists(sentences):
+    return [tokenize_content_words(s) for s in sentences]
+
+def window_word_counts(word_lists, start, end):
+    counts = Counter()
+    for i in range(start, end):
+        counts.update(word_lists[i])
+    return counts
+
+def lexical_overlap_score(left_counts, right_counts):
+    if not left_counts or not right_counts:
+        return 0.0
+    left_words = set(left_counts)
+    right_words = set(right_counts)
+    shared = left_words & right_words
+    union = left_words | right_words
+    if not union:
+        return 0.0
+    jaccard = len(shared) / len(union)
+    shared_weight = sum(min(left_counts[w], right_counts[w]) for w in shared)
+    total_weight = sum(left_counts.values()) + sum(right_counts.values())
+    weighted_overlap = (2.0 * shared_weight / total_weight) if total_weight > 0 else 0.0
+    return (jaccard + weighted_overlap) / 2.0
+
+def compute_lexical_scores(word_lists, window):
+    n = len(word_lists)
+    scores = np.zeros(n)
+    for i in range(1, n):
+        left_start = max(0, i - window)
+        right_end = min(n, i + window)
+        left_counts = window_word_counts(word_lists, left_start, i)
+        right_counts = window_word_counts(word_lists, i, right_end)
+        overlap = lexical_overlap_score(left_counts, right_counts)
+        scores[i] = 1.0 - overlap
+    return scores
+
+def zscore(values):
+    values = np.asarray(values, dtype=float)
+    std = values.std()
+    if std < 1e-8:
+        return np.zeros_like(values)
+    return (values - values.mean()) / std
+
+def combine_scores(embedding_scores, lexical_scores, embedding_weight, lexical_weight):
+    embedding_z = zscore(embedding_scores)
+    lexical_z = zscore(lexical_scores)
+    combined = embedding_weight * embedding_z + lexical_weight * lexical_z
+    combined[0] = 0.0
+    return combined
 
 def find_local_maxima(scores):
     n = len(scores)
@@ -156,7 +243,10 @@ def main():
         return
     print(f"{len(sentences)} sentences detected.")
     embeddings = embed_sentences(sentences)
-    scores = compute_boundary_scores(embeddings, COHESION_WINDOW)
+    embedding_scores = compute_embedding_scores(embeddings, NEIGHBOR_RADIUS, LOCAL_K)
+    word_lists = build_sentence_word_lists(sentences)
+    lexical_scores = compute_lexical_scores(word_lists, LEXICAL_WINDOW)
+    scores = combine_scores(embedding_scores, lexical_scores, EMBEDDING_WEIGHT, LEXICAL_WEIGHT)
     candidates = rank_candidates(scores)
     print_all_candidates(sentences, candidates)
     target_count = select_target_count(sentences)
