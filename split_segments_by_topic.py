@@ -6,11 +6,10 @@ from sentence_transformers import SentenceTransformer
 
 input_path = "input.txt"
 output_path = "output_segments.txt"
-split_marker = "[chapter]"
 model_name = "google/embeddinggemma-300m"
 language = input("Language (en): ") or "en"
 TRUST_CODE = False
-target_words = int(input("Target words (1000): ")) or 1000
+target_words = int(input("Target words (1000): ") or 1000)
 min_words = int(target_words - (target_words / 3))
 max_words = int(target_words + (target_words / 3))
 print(f"Range: {min_words}-{max_words}")
@@ -53,32 +52,7 @@ def read_source_text():
         return f.read()
 
 def split_into_chapters(text):
-    parts = text.split(split_marker)
-    if parts and parts[0].strip() == "":
-        parts = parts[1:]
-    return parts
-
-def is_bare_title(chapter):
-    stripped = chapter.strip()
-    if stripped == "":
-        return False
-    return "\n" not in stripped
-
-def merge_bare_titles(chapters):
-    merged = []
-    pending_titles = []
-    for chapter in chapters:
-        if is_bare_title(chapter):
-            pending_titles.append(chapter.strip())
-            continue
-        if pending_titles:
-            prefix = "\n".join(pending_titles) + "\n"
-            chapter = prefix + chapter.lstrip("\n")
-            pending_titles = []
-        merged.append(chapter)
-    if pending_titles:
-        merged.append("\n".join(pending_titles))
-    return merged
+    return [line for line in text.splitlines() if line.strip()]
 
 def split_sentences(text):
     segmenter = pysbd.Segmenter(language=language, clean=False)
@@ -256,14 +230,12 @@ def split_chapter_into_parts(chapter):
     word_counts = [len(s.split()) for s in sentences]
     cuts = choose_cuts(scores, word_counts)
     parts = cut_text(chapter, starts, cuts)
-    print("Chapter of {} words, {} sentences, split into {} parts".format(total_words, len(sentences), len(parts)))
+    print("Block of {} words, {} sentences, split into {} parts".format(total_words, len(sentences), len(parts)))
     return parts
 
 def build_segments(chapters):
     segments = []
     for chapter in chapters:
-        if not chapter.strip():
-            continue
         segments.extend(split_chapter_into_parts(chapter))
     return segments
 
@@ -280,7 +252,6 @@ def print_size_report(segments):
 def main():
     text = read_source_text()
     chapters = split_into_chapters(text)
-    chapters = merge_bare_titles(chapters)
     segments = build_segments(chapters)
     if not segments:
         print("No text found in " + input_path)
@@ -289,5 +260,5 @@ def main():
     print_size_report(segments)
 
 if __name__ == "__main__":
-    print("This splits by the [chapter] marker")
+    print("This segments on blank lines.")
     main()
